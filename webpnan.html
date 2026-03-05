@@ -1,0 +1,744 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, doc, setDoc, onSnapshot, deleteDoc, updateDoc, increment } from 'firebase/firestore';
+import { Plus, Minus, Trash2, Share2, Users, DollarSign, Activity, Check, Edit2, ListOrdered, UserPlus, X, Play, CheckCircle2, Circle } from 'lucide-react';
+
+// --- ⚠️ 1. ใส่ตั้งค่า Firebase ของคุณตรงนี้ (สำหรับการนำไปขึ้นเว็บจริง) ⚠️ ---
+const myFirebaseConfig = {
+  apiKey: "AIzaSyBOBE61_ouVvTlGeXsVR9mRrNP06STQgjg",
+  authDomain: "my-badminton-app-1fd9d.firebaseapp.com",
+  projectId: "my-badminton-app-1fd9d",
+  storageBucket: "my-badminton-app-1fd9d.firebasestorage.app",
+  messagingSenderId: "1064755512908",
+  appId: "1:1064755512908:web:3ca6ee70006c3fda68d6e9",
+  measurementId: "G-73B72PN5L8"
+};
+
+// --- Firebase Initialization ---
+let app, auth, db;
+const firebaseConfigStr = typeof __firebase_config !== 'undefined' ? __firebase_config : JSON.stringify(myFirebaseConfig);
+try {
+  const firebaseConfig = JSON.parse(firebaseConfigStr);
+  if (Object.keys(firebaseConfig).length > 0) {
+    app = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    db = getFirestore(app);
+  }
+} catch (e) {
+  console.error('Error parsing firebase config', e);
+}
+
+// ⚠️ 2. ตั้งชื่อ ID ของแอปคุณ (ภาษาอังกฤษ/ตัวเลข/ขีด)
+const urlParams = new URLSearchParams(window.location.search);
+const roomFromUrl = urlParams.get('room');
+const appId = roomFromUrl || (typeof __app_id !== 'undefined' ? __app_id : 'my-badminton-court-01');
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  
+  const [players, setPlayers] = useState([]);
+  const [games, setGames] = useState([]); 
+  
+  const [defaultPrice, setDefaultPrice] = useState(25);
+  const [newPlayerName, setNewPlayerName] = useState('');
+  const [newPlayerPrice, setNewPlayerPrice] = useState(25);
+  const [isCopied, setIsCopied] = useState(false);
+  const [errorMsg, setErrorMsg] = useState('');
+  
+  // UI States
+  const [activeTab, setActiveTab] = useState('summary'); // เริ่มที่หน้าสรุปยอด
+  const [isRecordingGame, setIsRecordingGame] = useState(false);
+  const [selectedPlayersForGame, setSelectedPlayersForGame] = useState([]);
+
+  // 1. Initialize Authentication
+  useEffect(() => {
+    if (!auth) {
+      setLoading(false);
+      setErrorMsg('ไม่สามารถเชื่อมต่อระบบฐานข้อมูลได้');
+      return;
+    }
+
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Auth Error:", error);
+        setErrorMsg('เกิดข้อผิดพลาดในการเข้าสู่ระบบ');
+      }
+    };
+
+    initAuth();
+
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      if (!currentUser) setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // 2. Data Fetching (Listeners)
+  useEffect(() => {
+    if (!user || !db) return;
+
+    const playersRef = collection(db, 'artifacts', appId, 'public', 'data', 'players');
+    const gamesRef = collection(db, 'artifacts', appId, 'public', 'data', 'games');
+    const configRef = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config');
+
+    // Listen to Players
+    const unsubscribePlayers = onSnapshot(playersRef, (snapshot) => {
+      const playersData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      playersData.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+      setPlayers(playersData);
+      setLoading(false);
+    }, (error) => console.error("Error fetching players:", error));
+
+    // Listen to Games
+    const unsubscribeGames = onSnapshot(gamesRef, (snapshot) => {
+      const gamesData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      gamesData.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+      setGames(gamesData);
+    }, (error) => console.error("Error fetching games:", error));
+
+    // Listen to Settings
+    const unsubscribeConfig = onSnapshot(configRef, (docSnap) => {
+      if (docSnap.exists() && docSnap.data().pricePerUnit !== undefined) {
+        const dPrice = docSnap.data().pricePerUnit;
+        setDefaultPrice(dPrice);
+        setNewPlayerPrice(dPrice);
+      }
+    }, (error) => console.error("Error fetching config:", error));
+
+    return () => {
+      unsubscribePlayers();
+      unsubscribeGames();
+      unsubscribeConfig();
+    };
+  }, [user]);
+
+  // --- Handlers: Players ---
+
+  const handleAddPlayer = async (e) => {
+    e.preventDefault();
+    if (!newPlayerName.trim() || !user || !db) return;
+
+    const newPlayer = {
+      name: newPlayerName.trim(),
+      count: 0,
+      price: Number(newPlayerPrice) || 0,
+      isPaid: false, // เพิ่มสถานะการจ่ายเงิน
+      createdAt: Date.now()
+    };
+
+    try {
+      const newDocRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'players'));
+      await setDoc(newDocRef, newPlayer);
+      setNewPlayerName('');
+    } catch (error) {
+      console.error("Error adding player:", error);
+    }
+  };
+
+  const handleUpdateCount = async (id, currentCount, delta) => {
+    if (!user || !db) return;
+    const newCount = Math.max(0, currentCount + delta);
+    try {
+      const playerRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', id);
+      // ถ้ามีการบวกเพิ่มหรือลบยอด ให้ถือว่ายังไม่เสร็จสิ้นการจ่าย (ตั้ง isPaid กลับเป็น false)
+      await updateDoc(playerRef, { count: newCount, isPaid: false });
+    } catch (error) {
+      console.error("Error updating count:", error);
+    }
+  };
+
+  const handleUpdatePlayerPrice = async (id, priceStr) => {
+    if (!user || !db) return;
+    const newPrice = priceStr === '' ? 0 : Number(priceStr);
+    try {
+      const playerRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', id);
+      await updateDoc(playerRef, { price: newPrice });
+    } catch (error) {
+      console.error("Error updating player price:", error);
+    }
+  };
+
+  const handleTogglePaid = async (id, currentPaidStatus) => {
+    if (!user || !db) return;
+    try {
+      const playerRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', id);
+      await updateDoc(playerRef, { isPaid: !currentPaidStatus });
+    } catch (error) {
+      console.error("Error updating paid status:", error);
+    }
+  };
+
+  const handleDeletePlayer = async (id) => {
+    if (!user || !db) return;
+    try {
+      const playerRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', id);
+      await deleteDoc(playerRef);
+    } catch (error) {
+      console.error("Error deleting player:", error);
+    }
+  };
+
+  // --- Handlers: Games ---
+
+  const togglePlayerForGame = (player) => {
+    setSelectedPlayersForGame(prev => {
+      const isSelected = prev.some(p => p.id === player.id);
+      if (isSelected) return prev.filter(p => p.id !== player.id);
+      return [...prev, player];
+    });
+  };
+
+  const handleSaveGame = async () => {
+    if (!user || !db || selectedPlayersForGame.length === 0) return;
+
+    const newGame = {
+      playerIds: selectedPlayersForGame.map(p => p.id),
+      playerNames: selectedPlayersForGame.map(p => p.name),
+      createdAt: Date.now()
+    };
+
+    try {
+      const newGameRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'games'));
+      await setDoc(newGameRef, newGame);
+
+      const updatePromises = selectedPlayersForGame.map(player => {
+        const playerRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', player.id);
+        // บวกยอด และรีเซ็ตสถานะจ่ายเงินเพราะมียอดใหม่เข้ามา
+        return updateDoc(playerRef, { count: increment(1), isPaid: false });
+      });
+      await Promise.all(updatePromises);
+
+      setIsRecordingGame(false);
+      setSelectedPlayersForGame([]);
+    } catch (error) {
+      console.error("Error saving game:", error);
+    }
+  };
+
+  const handleDeleteGame = async (game) => {
+    if (!user || !db) return;
+    try {
+      const gameRef = doc(db, 'artifacts', appId, 'public', 'data', 'games', game.id);
+      await deleteDoc(gameRef);
+
+      const updatePromises = game.playerIds.map(playerId => {
+        const playerExists = players.some(p => p.id === playerId);
+        if (playerExists) {
+           const playerRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', playerId);
+           return updateDoc(playerRef, { count: increment(-1) });
+        }
+        return Promise.resolve();
+      });
+      await Promise.all(updatePromises);
+
+    } catch (error) {
+      console.error("Error deleting game:", error);
+    }
+  };
+
+  const handleClearAllGamesAndCounts = async () => {
+    if (!user || !db) return;
+    try {
+      const deleteGamesPromises = games.map(game => {
+        const gameRef = doc(db, 'artifacts', appId, 'public', 'data', 'games', game.id);
+        return deleteDoc(gameRef);
+      });
+      
+      const resetCountsPromises = players.map(player => {
+        const playerRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', player.id);
+        return updateDoc(playerRef, { count: 0, isPaid: false }); // รีเซ็ตสถานะจ่ายเงินด้วย
+      });
+
+      await Promise.all([...deleteGamesPromises, ...resetCountsPromises]);
+    } catch (error) {
+      console.error("Error clearing data:", error);
+    }
+  };
+
+  // --- Handlers: Settings & Share ---
+  
+  const handleUpdateDefaultPrice = async (e) => {
+    const newPrice = Number(e.target.value);
+    setDefaultPrice(newPrice);
+    setNewPlayerPrice(newPrice);
+    if (!user || !db || isNaN(newPrice)) return;
+    try {
+      const configRef = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config');
+      await setDoc(configRef, { pricePerUnit: newPrice }, { merge: true });
+    } catch (error) {
+      console.error("Error updating default price:", error);
+    }
+  };
+
+  const handleShare = () => {
+    // สร้างลิงก์ที่แนบรหัสห้อง (?room=) เพื่อให้คนอื่นเข้าถึงข้อมูลเดียวกัน
+    let baseUrl = window.location.href.split('?')[0];
+    const url = `${baseUrl}?room=${appId}`;
+
+    // แจ้งเตือนหากใช้งานอยู่ในหน้าต่าง Preview (AI Sandbox)
+    if (window.location.hostname === '' || window.location.href.includes('blob:') || window.location.hostname.includes('sandbox') || window.location.hostname.includes('runner')) {
+        setErrorMsg('ตอนนี้ระบบรันอยู่ในโหมดทดสอบ (Preview) ลิงก์จำลองที่ได้ไปคนอื่นจะเปิดไม่ได้ครับ ต้องนำโค้ดไปอัปโหลดเป็นเว็บไซต์จริงก่อน');
+        setTimeout(() => setErrorMsg(''), 7000);
+    }
+
+    try {
+      navigator.clipboard.writeText(url).then(() => {
+        setIsCopied(true);
+        setTimeout(() => setIsCopied(false), 2000);
+      }).catch(err => {
+        const textArea = document.createElement("textarea");
+        textArea.value = url;
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        try { document.execCommand('copy'); setIsCopied(true); setTimeout(() => setIsCopied(false), 2000); } 
+        catch (err) { console.error('Fallback error', err); }
+        document.body.removeChild(textArea);
+      });
+    } catch (error) { console.error("Clipboard API error", error); }
+  };
+
+  // --- Calculations ---
+  const getPlayerPrice = (player) => player.price !== undefined ? player.price : defaultPrice;
+  const totalShuttlecocks = players.reduce((sum, player) => sum + player.count, 0);
+  
+  // คำนวณยอดเงินรวมทั้งหมด
+  const totalCost = players.reduce((sum, player) => sum + (player.count * getPlayerPrice(player)), 0);
+  
+  // คำนวณยอดเงินที่จ่ายแล้ว
+  const collectedAmount = players.reduce((sum, player) => {
+    if (player.isPaid) {
+      return sum + (player.count * getPlayerPrice(player));
+    }
+    return sum;
+  }, 0);
+
+  // คำนวณยอดคงค้าง
+  const pendingAmount = totalCost - collectedAmount;
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center font-sans">
+        <div className="flex flex-col items-center text-emerald-600">
+          <Activity className="w-12 h-12 animate-spin mb-4" />
+          <p className="text-lg font-medium">กำลังโหลดข้อมูลสนาม...</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 font-sans pb-40">
+      {/* Header */}
+      <div className="bg-emerald-600 text-white p-4 shadow-md sticky top-0 z-10">
+        <div className="max-w-3xl mx-auto flex justify-between items-center">
+          <div className="flex items-center gap-2">
+            <div className="bg-white/20 p-2 rounded-lg">
+              <Activity className="w-6 h-6" />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold leading-none">แบดมินตันทราคเกอร์</h1>
+              <p className="text-emerald-100 text-xs mt-1">จดเกม / สรุปยอดเงิน</p>
+            </div>
+          </div>
+          <button 
+            onClick={handleShare}
+            className="flex items-center gap-2 bg-emerald-700 hover:bg-emerald-800 transition-colors px-3 py-2 rounded-lg text-sm font-medium"
+          >
+            {isCopied ? <Check className="w-4 h-4" /> : <Share2 className="w-4 h-4" />}
+            <span className="hidden sm:inline">{isCopied ? 'คัดลอกแล้ว' : 'แชร์ลิงก์'}</span>
+          </button>
+        </div>
+        
+        {/* Navigation Tabs */}
+        <div className="max-w-3xl mx-auto mt-4 flex bg-emerald-700/50 rounded-lg p-1">
+          <button 
+            onClick={() => setActiveTab('games')}
+            className={`flex-1 py-2 text-sm font-medium rounded-md flex items-center justify-center gap-2 transition-all ${activeTab === 'games' ? 'bg-white text-emerald-700 shadow-sm' : 'text-emerald-50 hover:bg-emerald-600/50'}`}
+          >
+            <Play className="w-4 h-4" /> ตารางเกม
+          </button>
+          <button 
+            onClick={() => setActiveTab('summary')}
+            className={`flex-1 py-2 text-sm font-medium rounded-md flex items-center justify-center gap-2 transition-all ${activeTab === 'summary' ? 'bg-white text-emerald-700 shadow-sm' : 'text-emerald-50 hover:bg-emerald-600/50'}`}
+          >
+            <DollarSign className="w-4 h-4" /> สรุปยอดเงิน
+          </button>
+        </div>
+      </div>
+
+      <div className="max-w-3xl mx-auto p-4 space-y-6">
+        {errorMsg && (
+          <div className="bg-red-100 border border-red-200 text-red-700 px-4 py-3 rounded-xl">{errorMsg}</div>
+        )}
+
+        {/* --- TAB: GAMES HISTORY --- */}
+        {activeTab === 'games' && (
+          <div className="space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-300">
+            <button 
+              onClick={() => setIsRecordingGame(true)}
+              className="w-full bg-emerald-600 hover:bg-emerald-700 text-white p-4 rounded-2xl font-bold text-lg flex items-center justify-center gap-2 shadow-sm transition-all active:scale-95"
+            >
+              <UserPlus className="w-6 h-6" />
+              บันทึกเกมใหม่
+            </button>
+
+            <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+              <div className="p-4 bg-slate-50 border-b border-slate-100 flex justify-between items-center">
+                <h2 className="font-semibold text-slate-700 flex items-center gap-2">
+                  <ListOrdered className="w-5 h-5" /> ประวัติการตี ({games.length} เกม)
+                </h2>
+                {games.length > 0 && (
+                  <button 
+                    onClick={handleClearAllGamesAndCounts}
+                    className="text-xs text-red-500 hover:text-red-700 font-medium bg-red-50 px-3 py-1.5 rounded-lg border border-red-100"
+                  >
+                    ลบประวัติทั้งหมด
+                  </button>
+                )}
+              </div>
+              
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="bg-slate-50/50 text-slate-500 text-sm border-b border-slate-100">
+                      <th className="p-3 font-medium text-center w-16">เกมที่</th>
+                      <th className="p-3 font-medium">รายชื่อผู้เล่นในเกม</th>
+                      <th className="p-3 font-medium text-center w-16">ลบ</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {games.length === 0 ? (
+                      <tr>
+                        <td colSpan="3" className="p-8 text-center text-slate-400">
+                          ยังไม่มีประวัติการตี กด "บันทึกเกมใหม่" ด้านบนเลยครับ
+                        </td>
+                      </tr>
+                    ) : (
+                      games.map((game, index) => (
+                        <tr key={game.id} className="hover:bg-slate-50 transition-colors">
+                          <td className="p-3 text-center font-bold text-slate-700">{index + 1}</td>
+                          <td className="p-3">
+                            <div className="flex flex-wrap gap-1.5">
+                              {game.playerNames.map((name, i) => (
+                                <span key={i} className="bg-emerald-50 text-emerald-700 border border-emerald-100 px-2.5 py-1 rounded-lg text-sm font-medium">
+                                  {name}
+                                </span>
+                              ))}
+                            </div>
+                          </td>
+                          <td className="p-3 text-center">
+                            <button 
+                              onClick={() => handleDeleteGame(game)}
+                              className="text-slate-300 hover:text-red-500 p-2 rounded-md transition-colors"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* --- TAB: SUMMARY & PLAYERS --- */}
+        {activeTab === 'summary' && (
+          <div className="space-y-6 animate-in fade-in slide-in-from-bottom-2 duration-300">
+            {/* Global Settings */}
+            <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <div className="bg-amber-100 text-amber-600 p-2 rounded-full">
+                    <DollarSign className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h2 className="font-semibold text-slate-800">ราคามาตรฐาน</h2>
+                    <p className="text-sm text-slate-500">สำหรับคนที่เพิ่มชื่อใหม่</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 bg-slate-50 p-1 rounded-xl border border-slate-200">
+                  <input
+                    type="number"
+                    value={defaultPrice}
+                    onChange={handleUpdateDefaultPrice}
+                    className="w-20 text-center text-lg font-bold bg-transparent p-2 focus:outline-none text-emerald-700"
+                    min="0"
+                  />
+                  <span className="text-slate-600 font-medium pr-3">บ./ลูก</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Add Player */}
+            <div className="bg-white rounded-2xl shadow-sm border border-emerald-100 p-4 relative overflow-hidden">
+              <div className="absolute top-0 left-0 w-1 h-full bg-emerald-500"></div>
+              <h3 className="text-sm font-semibold text-emerald-700 mb-3 ml-2">เพิ่มผู้เล่นใหม่เข้ากลุ่ม</h3>
+              <form onSubmit={handleAddPlayer} className="flex flex-col sm:flex-row gap-3 ml-2">
+                <input
+                  type="text"
+                  value={newPlayerName}
+                  onChange={(e) => setNewPlayerName(e.target.value)}
+                  placeholder="พิมพ์ชื่อ..."
+                  className="flex-1 border border-slate-200 rounded-xl px-4 py-3 focus:ring-2 focus:ring-emerald-500 outline-none shadow-sm"
+                />
+                <div className="flex gap-2">
+                  <div className="flex items-center gap-1 bg-slate-50 border border-slate-200 rounded-xl px-3 py-1 shadow-sm">
+                    <span className="text-xs text-slate-500 font-medium">ราคา:</span>
+                    <input
+                      type="number"
+                      value={newPlayerPrice}
+                      onChange={(e) => setNewPlayerPrice(e.target.value)}
+                      className="w-14 text-center text-base font-bold bg-transparent outline-none text-slate-700"
+                      min="0"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={!newPlayerName.trim()}
+                    className="bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white px-5 py-3 rounded-xl font-medium flex items-center justify-center transition-colors shadow-sm"
+                  >
+                    <Plus className="w-5 h-5" />
+                  </button>
+                </div>
+              </form>
+            </div>
+
+            {/* Players List */}
+            <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+              <div className="p-4 bg-slate-50 border-b border-slate-100 flex justify-between items-center">
+                <h2 className="font-semibold text-slate-700 flex items-center gap-2">
+                  <Users className="w-5 h-5" />
+                  สรุปรายบุคคล ({players.length})
+                </h2>
+              </div>
+              
+              <div className="divide-y divide-slate-100">
+                {players.length === 0 ? (
+                  <div className="p-10 text-center text-slate-400">
+                    <p>ยังไม่มีรายชื่อผู้เล่น เพิ่มรายชื่อด้านบนได้เลย</p>
+                  </div>
+                ) : (
+                  players.map(player => {
+                    const pPrice = getPlayerPrice(player);
+                    const pTotal = player.count * pPrice;
+
+                    return (
+                      <div key={player.id} className={`p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4 transition-colors ${player.isPaid ? 'bg-emerald-50/30' : 'hover:bg-slate-50/50'}`}>
+                        
+                        {/* Name & Price */}
+                        <div className="flex flex-col gap-2 w-full lg:w-2/5">
+                          <div className="flex items-center justify-between lg:justify-start gap-3">
+                            <span className={`font-bold text-lg truncate ${player.isPaid ? 'text-emerald-800' : 'text-slate-800'}`}>
+                              {player.name}
+                            </span>
+                            <button 
+                              onClick={() => handleDeletePlayer(player.id)}
+                              className="text-slate-300 hover:text-red-500 p-1 rounded-md transition-colors"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs text-slate-500 bg-slate-100 px-2 py-1 rounded-md flex items-center gap-1">
+                              <Edit2 className="w-3 h-3" /> ราคา:
+                            </span>
+                            <input
+                              type="number"
+                              value={player.price !== undefined ? player.price : ''}
+                              onChange={(e) => handleUpdatePlayerPrice(player.id, e.target.value)}
+                              placeholder={defaultPrice}
+                              className="w-16 border-b-2 border-slate-200 focus:border-emerald-500 text-center text-sm font-medium outline-none bg-transparent"
+                            />
+                            <span className="text-xs text-slate-500">บ./เกม</span>
+                          </div>
+                        </div>
+
+                        {/* Counter (Manual Adjust) */}
+                        <div className="flex items-center justify-between lg:justify-center gap-4 bg-slate-50 lg:bg-transparent p-3 lg:p-0 rounded-xl w-full lg:w-auto">
+                          <span className="lg:hidden text-sm font-medium text-slate-500">จำนวนที่เล่น:</span>
+                          <div className={`flex items-center gap-4 ${player.isPaid ? 'opacity-60' : ''}`}>
+                            <button
+                              onClick={() => handleUpdateCount(player.id, player.count, -1)}
+                              disabled={player.count === 0}
+                              className="w-10 h-10 flex items-center justify-center bg-white border border-slate-200 rounded-full text-slate-600 hover:bg-slate-100 disabled:opacity-50"
+                            >
+                              <Minus className="w-5 h-5" />
+                            </button>
+                            <span className="w-10 text-center text-2xl font-black text-slate-800">
+                              {player.count}
+                            </span>
+                            <button
+                              onClick={() => handleUpdateCount(player.id, player.count, 1)}
+                              className="w-10 h-10 flex items-center justify-center bg-emerald-50 border border-emerald-200 rounded-full text-emerald-600 hover:bg-emerald-100"
+                            >
+                              <Plus className="w-5 h-5" />
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Subtotal & Paid Toggle */}
+                        <div className="w-full lg:w-1/3 flex flex-row lg:flex-col justify-between items-center lg:items-end gap-2 bg-slate-50 lg:bg-transparent p-3 lg:p-0 rounded-xl">
+                          <div className="flex flex-col items-start lg:items-end">
+                            <div className="text-sm text-slate-500 lg:mb-1">ยอดต้องจ่าย</div>
+                            <span className={`text-xl font-bold ${player.isPaid ? 'text-emerald-700' : 'text-slate-800'}`}>
+                              {pTotal.toLocaleString()} <span className="text-sm font-normal">บาท</span>
+                            </span>
+                          </div>
+                          
+                          {/* ปุ่มจ่ายแล้ว / รอจ่าย */}
+                          <button
+                            onClick={() => handleTogglePaid(player.id, player.isPaid)}
+                            disabled={pTotal === 0}
+                            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold transition-all ${
+                              pTotal === 0 
+                                ? 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                                : player.isPaid
+                                  ? 'bg-emerald-500 hover:bg-emerald-600 text-white shadow-sm ring-2 ring-emerald-500 ring-offset-1'
+                                  : 'bg-white border-2 border-slate-200 text-slate-500 hover:border-slate-300 hover:bg-slate-50'
+                            }`}
+                          >
+                            {player.isPaid ? (
+                              <>
+                                <CheckCircle2 className="w-5 h-5" />
+                                จ่ายแล้ว
+                              </>
+                            ) : (
+                              <>
+                                <Circle className="w-5 h-5" />
+                                รอจ่ายเงิน
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* --- MODAL: RECORD NEW GAME --- */}
+      {isRecordingGame && (
+        <div className="fixed inset-0 bg-slate-900/60 z-50 flex items-end sm:items-center justify-center backdrop-blur-sm p-0 sm:p-4 animate-in fade-in duration-200">
+          <div className="bg-white w-full max-w-md rounded-t-3xl sm:rounded-3xl shadow-2xl flex flex-col max-h-[90vh]">
+            
+            <div className="p-5 border-b border-slate-100 flex justify-between items-center">
+              <div>
+                <h2 className="text-xl font-bold text-slate-800">บันทึกเกมใหม่</h2>
+                <p className="text-sm text-slate-500">แตะเลือกรายชื่อคนที่ลงสนาม ({selectedPlayersForGame.length} คน)</p>
+              </div>
+              <button 
+                onClick={() => {
+                  setIsRecordingGame(false);
+                  setSelectedPlayersForGame([]);
+                }}
+                className="p-2 bg-slate-100 text-slate-500 hover:bg-slate-200 rounded-full transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-5 overflow-y-auto flex-1">
+              {players.length === 0 ? (
+                <p className="text-center text-slate-500 py-10">ยังไม่มีรายชื่อผู้เล่นในระบบ<br/>กรุณาเพิ่มชื่อที่หน้า "สรุปยอดเงิน"</p>
+              ) : (
+                <div className="grid grid-cols-2 gap-3">
+                  {players.map(player => {
+                    const isSelected = selectedPlayersForGame.some(p => p.id === player.id);
+                    return (
+                      <button
+                        key={player.id}
+                        onClick={() => togglePlayerForGame(player)}
+                        className={`p-3 rounded-xl border-2 text-left font-semibold transition-all ${
+                          isSelected 
+                            ? 'bg-emerald-50 border-emerald-500 text-emerald-700 shadow-sm' 
+                            : 'bg-white border-slate-200 text-slate-600 hover:border-emerald-300'
+                        }`}
+                      >
+                        <div className="flex justify-between items-center">
+                          <span className="truncate">{player.name}</span>
+                          {isSelected && <Check className="w-4 h-4 text-emerald-600" />}
+                        </div>
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="p-5 border-t border-slate-100 bg-slate-50 rounded-b-3xl">
+              <button
+                onClick={handleSaveGame}
+                disabled={selectedPlayersForGame.length === 0}
+                className="w-full py-4 rounded-xl font-bold text-lg text-white bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 transition-all flex justify-center items-center gap-2 shadow-md"
+              >
+                <Check className="w-6 h-6" />
+                บันทึกเกม ({selectedPlayersForGame.length} คน)
+              </button>
+            </div>
+            
+          </div>
+        </div>
+      )}
+
+      {/* Bottom Sticky Summary */}
+      <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 shadow-[0_-10px_20px_-10px_rgba(0,0,0,0.1)] pb-safe z-20">
+        {/* แถบความคืบหน้าการจ่ายเงินด้านบนของสรุป */}
+        <div className="h-1.5 w-full bg-slate-100 flex">
+          <div 
+            className="h-full bg-emerald-500 transition-all duration-500" 
+            style={{ width: totalCost > 0 ? `${(collectedAmount / totalCost) * 100}%` : '0%' }}
+          ></div>
+        </div>
+
+        <div className="max-w-3xl mx-auto p-4 flex items-center justify-between">
+          <div className="flex gap-4 sm:gap-8">
+            <div>
+              <p className="text-slate-500 text-[10px] sm:text-xs mb-1 uppercase tracking-wider font-bold">เกมทั้งหมด</p>
+              <p className="text-base sm:text-xl font-bold text-slate-800">
+                {totalShuttlecocks} <span className="text-xs font-normal text-slate-500">รอบ</span>
+              </p>
+            </div>
+            <div>
+              <p className="text-slate-500 text-[10px] sm:text-xs mb-1 uppercase tracking-wider font-bold">ยอดเงินรวม</p>
+              <p className="text-base sm:text-xl font-bold text-slate-800">
+                {totalCost.toLocaleString()} <span className="text-xs font-normal text-slate-500">บ.</span>
+              </p>
+            </div>
+          </div>
+          
+          <div className="text-right flex flex-col items-end">
+            <div className="flex items-center gap-2 mb-1">
+              <p className="text-emerald-600 text-[10px] sm:text-xs font-bold uppercase tracking-wider flex items-center gap-1">
+                <CheckCircle2 className="w-3 h-3" /> เก็บแล้ว: {collectedAmount.toLocaleString()} บ.
+              </p>
+            </div>
+            <div className="bg-slate-800 text-white px-3 py-1.5 rounded-lg inline-flex items-baseline gap-1 shadow-sm">
+              <span className="text-xs text-slate-300">รอเก็บอีก</span>
+              <span className="text-xl sm:text-2xl font-black">{pendingAmount.toLocaleString()}</span>
+              <span className="text-xs text-slate-300">บาท</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  );
+}
